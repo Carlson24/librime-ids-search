@@ -1,6 +1,6 @@
 //
-// ids_search_translator.cc — 部件检字翻译器（C++ 移植自 Lua ids_search.lua
-// v1.4.0）。
+// ids_search_translator.cc — 部件检字翻译器（C++，IDS3
+// 数据格式，面向查询延迟）。
 //
 #include "ids_search_translator.h"
 
@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -45,9 +46,8 @@ uint32_t DecodeNext(const std::string& s, size_t* i) {
     return 0;
   unsigned char b1 = static_cast<unsigned char>(s[*i]);
   if (b1 < 0x80) {
-    uint32_t cp = b1;
     *i += 1;
-    return cp;
+    return b1;
   }
   if (b1 < 0xE0) {
     if (*i + 1 >= n)
@@ -111,7 +111,6 @@ std::vector<std::string> Utf8Chars(const std::string& s) {
     size_t old = i;
     DecodeNext(s, &i);
     if (i == old) {
-      // 非法字节：逐字节回退
       out.push_back(s.substr(old, 1));
       i = old + 1;
     } else {
@@ -176,8 +175,24 @@ std::string Join(const std::vector<std::string>& v, const std::string& sep) {
   return r;
 }
 
+// Epoch 标记集：O(1) 去重，零分配。
+struct EpochSet {
+  std::vector<uint32_t> mark;
+  uint32_t gen = 0;
+  void Reset(size_t n) {
+    if (mark.size() < n)
+      mark.assign(n, 0);
+    if (++gen == 0) {
+      std::fill(mark.begin(), mark.end(), 0);
+      gen = 1;
+    }
+  }
+  bool Has(uint32_t x) const { return mark[x] == gen; }
+  void Add(uint32_t x) { mark[x] = gen; }
+};
+
 // ---------------------------------------------------------------------------
-// 双拼解码（flypy / zrm），逐字移植 Lua 版本
+// 双拼解码（flypy / zrm）
 // ---------------------------------------------------------------------------
 
 const char* SpInitMap(char c) {
@@ -304,14 +319,11 @@ bool IsIn(const char* init, std::initializer_list<const char*> list) {
   return false;
 }
 
-// 双拼音节解码。成功返回 syllable，失败返回空串。
 std::string DecodeFlypySyllable(const std::string& code) {
   if (code.size() != 2)
     return "";
   char c1 = code[0];
   char c2 = code[1];
-
-  // 零声母
   if (c1 == 'a') {
     if (c2 == 'a')
       return "a";
@@ -332,13 +344,11 @@ std::string DecodeFlypySyllable(const std::string& code) {
     if (c2 == 'g')
       return "eng";
   }
-
   std::string init;
   if (const char* m = SpInitMap(c1))
     init = m;
   else
     init = std::string(1, c1);
-
   const char* final = nullptr;
   if (c2 == 'k') {
     final =
@@ -363,7 +373,6 @@ std::string DecodeFlypySyllable(const std::string& code) {
   } else {
     final = FlypyFinalMap(c2);
   }
-
   if (!final)
     return "";
   if (IsIn(init.c_str(), {"j", "q", "x", "y"}) && std::string(final) == "ue")
@@ -378,7 +387,6 @@ std::string DecodeZrmSyllable(const std::string& code) {
     return "";
   char c1 = code[0];
   char c2 = code[1];
-
   if (c1 == 'a') {
     if (c2 == 'a')
       return "a";
@@ -399,13 +407,11 @@ std::string DecodeZrmSyllable(const std::string& code) {
     if (c2 == 'g')
       return "eng";
   }
-
   std::string init;
   if (const char* m = SpInitMap(c1))
     init = m;
   else
     init = std::string(1, c1);
-
   const char* final = nullptr;
   if (c2 == 'y') {
     final =
@@ -430,7 +436,6 @@ std::string DecodeZrmSyllable(const std::string& code) {
   } else {
     final = ZrmFinalMap(c2);
   }
-
   if (!final)
     return "";
   return init + final;
@@ -446,7 +451,6 @@ bool DecodeShuangpinString(IdsStore& store,
     parts = SplitSeparator(s);
   else
     parts.push_back(s);
-
   std::vector<std::string> res;
   for (const auto& part : parts) {
     size_t n_part = part.size();
@@ -472,7 +476,7 @@ bool DecodeShuangpinString(IdsStore& store,
 }
 
 // ---------------------------------------------------------------------------
-// 全拼最优切分（memo DFS）
+// 全拼最优切分
 // ---------------------------------------------------------------------------
 
 const hash_set<std::string>& ZeroInitials() {
@@ -480,12 +484,10 @@ const hash_set<std::string>& ZeroInitials() {
                                           "ang", "ou", "er", "en", "eng", "ei"};
   return k;
 }
-
 const hash_set<std::string>& Initials2() {
   static const hash_set<std::string> k = {"zh", "ch", "sh"};
   return k;
 }
-
 const hash_set<std::string>& Initials1() {
   static const hash_set<std::string> k = {"b", "p", "m", "f", "d", "t", "n",
                                           "l", "g", "k", "h", "j", "q", "x",
@@ -499,14 +501,12 @@ std::vector<std::string> SegmentPinyinOptimal(IdsStore& store,
   std::vector<std::string> result;
   if (n == 0)
     return result;
-
   struct Memo {
     bool set = false;
     int cost = 0;
     std::vector<std::string> segs;
   };
   std::vector<Memo> memo(n + 1);
-
   std::function<void(size_t)> dfs = [&](size_t idx) {
     if (idx >= n) {
       memo[idx].set = true;
@@ -516,7 +516,6 @@ std::vector<std::string> SegmentPinyinOptimal(IdsStore& store,
     }
     if (memo[idx].set)
       return;
-
     int best_cost = 1000000000;
     std::vector<std::string> best_segs;
     size_t max_len = std::min<size_t>(6, n - idx);
@@ -551,7 +550,6 @@ std::vector<std::string> SegmentPinyinOptimal(IdsStore& store,
         }
       }
     }
-
     if (!found) {
       std::string sub = s.substr(idx, 1);
       dfs(idx + 1);
@@ -561,22 +559,22 @@ std::vector<std::string> SegmentPinyinOptimal(IdsStore& store,
       for (const auto& seg : memo[idx + 1].segs)
         best_segs.push_back(seg);
     }
-
     memo[idx].set = true;
     memo[idx].cost = best_cost;
     memo[idx].segs.swap(best_segs);
   };
-
   dfs(0);
   return memo[0].segs;
 }
 
 // ---------------------------------------------------------------------------
-// 拼音切分缓存与组件解析
+// 拼音切分缓存与 matcher 缓存
 // ---------------------------------------------------------------------------
 
 LruCache<std::string, std::vector<std::string>> g_seg_cache(2048);
-LruCache<std::string, std::vector<std::string>> g_prefix_cache(128);
+LruCache<std::string, std::vector<uint16_t>> g_prefix_cache(128);
+LruCache<std::string, std::vector<uint16_t>> g_matcher_cache(128);
+LruCache<std::string, std::map<uint32_t, int>> g_rank_cache(64);
 
 std::vector<std::string> SegmentAlphaString(IdsStore& store,
                                             const std::string& chunk,
@@ -586,7 +584,6 @@ std::vector<std::string> SegmentAlphaString(IdsStore& store,
   std::string key = chunk + ":" + mode;
   if (const std::vector<std::string>* hit = g_seg_cache.Find(key))
     return *hit;
-
   const auto& py_map = store.py_map();
   std::vector<std::string> items;
   if (py_map.count(chunk) && (mode == "quanpin" || chunk.size() == 2)) {
@@ -594,7 +591,6 @@ std::vector<std::string> SegmentAlphaString(IdsStore& store,
     g_seg_cache.Put(key, items);
     return items;
   }
-
   if (mode == "flypy" || mode == "zrm") {
     std::vector<std::string> sp;
     if (DecodeShuangpinString(store, chunk, mode, &sp) && !sp.empty()) {
@@ -652,38 +648,106 @@ std::vector<std::string> SegmentAlphaString(IdsStore& store,
     }
     items.push_back(chunk);
   }
-
   g_seg_cache.Put(key, items);
   return items;
 }
 
-// 拼音前缀 -> 组件列表（缓存）。无匹配返回空指针。
-const std::vector<std::string>* GetCompsByPrefix(IdsStore& store,
-                                                 const std::string& pref) {
+const std::vector<uint16_t>* GetCompsByPrefix(IdsStore& store,
+                                              const std::string& pref) {
   if (pref.empty())
     return nullptr;
-  std::vector<std::string>* cached = g_prefix_cache.Find(pref);
+  std::vector<uint16_t>* cached = g_prefix_cache.Find(pref);
   if (cached)
     return cached->empty() ? nullptr : cached;
-
-  std::vector<std::string> res;
-  hash_set<std::string> seen;
+  std::vector<uint16_t> res;
+  hash_set<uint16_t> seen;
   size_t pref_len = pref.size();
   for (const auto& kv : store.py_map()) {
     if (kv.first.size() >= pref_len &&
         kv.first.compare(0, pref_len, pref) == 0) {
-      for (const auto& c : kv.second) {
-        if (seen.insert(c).second)
-          res.push_back(c);
+      for (uint16_t t : kv.second) {
+        if (seen.insert(t).second)
+          res.push_back(t);
       }
     }
   }
+  if (res.size() > 1) {
+    std::sort(res.begin(), res.end(), [&](uint16_t a, uint16_t b) {
+      auto freq = [&](uint16_t t) -> uint32_t {
+        uint32_t cp = store.TokenCp(t);
+        uint32_t id = cp ? store.IdOfCp(cp) : kInvalidId;
+        return id == kInvalidId ? 0 : store.Hot(id).freq;
+      };
+      return freq(a) > freq(b);
+    });
+  }
   auto& slot = g_prefix_cache.Ensure(pref);
   slot = res;
-  if (slot.empty())
-    return nullptr;
+  return slot.empty() ? nullptr : &slot;
+}
+
+const std::vector<uint16_t>* GetTermMatcher(IdsStore& store,
+                                            const std::string& term) {
+  std::vector<uint16_t>* cached = g_matcher_cache.Find(term);
+  if (cached)
+    return cached;
+  std::vector<uint16_t> v;
+  auto it = store.py_map().find(term);
+  if (it != store.py_map().end() && !it->second.empty()) {
+    v = it->second;
+  } else {
+    const std::vector<uint16_t>* pref = GetCompsByPrefix(store, term);
+    if (pref && !pref->empty()) {
+      v = *pref;
+    } else {
+      // 原文与 Canon 归一两者都要纳入，才能命中 alts 中已归一的部件 token。
+      uint16_t t;
+      if (store.FindToken(term, &t))
+        v.push_back(t);
+      std::string c = Canon(term);
+      if (c != term && store.FindToken(c, &t))
+        v.push_back(t);
+    }
+  }
+  std::sort(v.begin(), v.end());
+  v.erase(std::unique(v.begin(), v.end()), v.end());
+  auto& slot = g_matcher_cache.Ensure(term);
+  slot = std::move(v);
   return &slot;
 }
+
+const std::map<uint32_t, int>* GetDirectCompRank(IdsStore& store,
+                                                 const std::string& term) {
+  std::map<uint32_t, int>* cached = g_rank_cache.Find(term);
+  if (cached)
+    return cached;
+  std::map<uint32_t, int> rank;
+  int r = 1;
+  auto it = store.py_map().find(term);
+  if (it != store.py_map().end()) {
+    for (uint16_t t : it->second) {
+      uint32_t cp = store.TokenCp(t);
+      if (cp > 0 && !rank.count(cp))
+        rank[cp] = r++;
+    }
+  } else {
+    uint32_t cp = 0;
+    uint16_t t = store.ResolveTerm(term);
+    if (t != kNoToken)
+      cp = store.TokenCp(t);
+    if (cp == 0)
+      cp = CpOf(term);
+    if (cp > 0 && !rank.count(cp))
+      rank[cp] = r++;
+  }
+  auto& slot = g_rank_cache.Ensure(term);
+  slot = std::move(rank);
+  return &slot;
+}
+
+// ---------------------------------------------------------------------------
+// 查询解析
+// ---------------------------------------------------------------------------
 
 struct ParsedQuery {
   std::vector<std::string> items;
@@ -728,8 +792,6 @@ ParsedQuery ParseQuery(IdsStore& store,
         items.push_back(s);
     }
   }
-
-  hash_set<std::string> seen;
   for (const auto& item : items) {
     auto it = pq.counts.find(item);
     if (it == pq.counts.end()) {
@@ -744,143 +806,155 @@ ParsedQuery ParseQuery(IdsStore& store,
 }
 
 // ---------------------------------------------------------------------------
-// 匹配 / 打分（移植 Lua）
+// 匹配 / 打分
 // ---------------------------------------------------------------------------
 
-LruCache<std::string, hash_set<std::string>> g_matcher_cache(60);
-LruCache<std::string, hash_map<uint32_t, int>> g_rank_cache(60);
-
-// term -> 有效部件集合（含 canon 与原始形式）
-const hash_set<std::string>* GetTermMatcher(IdsStore& store,
-                                            const std::string& term) {
-  hash_set<std::string>* cached = g_matcher_cache.Find(term);
-  if (cached)
-    return cached;
-
-  hash_set<std::string> valid_set;
-  auto it = store.py_map().find(term);
-  if (it != store.py_map().end() && !it->second.empty()) {
-    for (const auto& comp : it->second) {
-      valid_set.insert(Canon(comp));
-      valid_set.insert(comp);
-    }
-  } else {
-    const std::vector<std::string>* pref = GetCompsByPrefix(store, term);
-    if (pref && !pref->empty()) {
-      for (const auto& comp : *pref) {
-        valid_set.insert(Canon(comp));
-        valid_set.insert(comp);
-      }
-    } else {
-      valid_set.insert(Canon(term));
-      valid_set.insert(term);
-    }
-  }
-  auto& slot = g_matcher_cache.Ensure(term);
-  slot = std::move(valid_set);
-  return &slot;
+inline bool MatcherHas(const std::vector<uint16_t>& m, uint16_t t) {
+  return std::binary_search(m.begin(), m.end(), t);
 }
 
-// 直系完美匹配：Tier1 有序 / Tier2 无序（2/3 项）
-int CheckDirectMatch(
-    const std::vector<std::vector<std::string>>& alts,
-    const std::vector<const hash_set<std::string>*>& matchers) {
-  if (alts.empty())
-    return 0;
-  size_t total = matchers.size();
-  int best = 0;
-  for (const auto& comps : alts) {
-    if (comps.size() != total)
-      continue;
-    // Tier 1 顺序完全一致
-    bool ordered = true;
-    for (size_t i = 0; i < total; ++i) {
-      if (!matchers[i]->count(comps[i])) {
-        ordered = false;
-        break;
-      }
+uint32_t FnvTokens(const uint16_t* t, uint32_t n) {
+  uint32_t h = 2166136261u;
+  for (uint32_t i = 0; i < n; ++i) {
+    uint16_t v = t[i];
+    h ^= (v & 0xFF);
+    h *= 16777619u;
+    h ^= ((v >> 8) & 0xFF);
+    h *= 16777619u;
+  }
+  return h;
+}
+
+bool BipartiteMatch(const uint16_t* comps,
+                    uint32_t total,
+                    const std::vector<const std::vector<uint16_t>*>& matchers,
+                    bool* used,
+                    uint32_t idx) {
+  if (idx == total)
+    return true;
+  for (uint32_t j = 0; j < total; ++j) {
+    if (!used[j] && MatcherHas(*matchers[j], comps[idx])) {
+      used[j] = true;
+      if (BipartiteMatch(comps, total, matchers, used, idx + 1))
+        return true;
+      used[j] = false;
     }
-    if (ordered)
-      return 2;
-    // Tier 2 无序
-    if (best < 1) {
-      if (total == 2) {
-        if ((matchers[0]->count(comps[0]) && matchers[1]->count(comps[1])) ||
-            (matchers[0]->count(comps[1]) && matchers[1]->count(comps[0]))) {
-          best = 1;
-        }
-      } else if (total == 3) {
-        const auto& m1 = matchers[0];
-        const auto& m2 = matchers[1];
-        const auto& m3 = matchers[2];
-        const auto& c1 = comps[0];
-        const auto& c2 = comps[1];
-        const auto& c3 = comps[2];
-        if ((m1->count(c1) && ((m2->count(c2) && m3->count(c3)) ||
-                               (m2->count(c3) && m3->count(c2)))) ||
-            (m1->count(c2) && ((m2->count(c1) && m3->count(c3)) ||
-                               (m2->count(c3) && m3->count(c1)))) ||
-            (m1->count(c3) && ((m2->count(c1) && m3->count(c2)) ||
-                               (m2->count(c2) && m3->count(c1))))) {
-          best = 1;
+  }
+  return false;
+}
+
+// alts 记录布局：u8 n_groups; { u8 len; u16 n_variants; { u16 tokens[len]; u32
+// sig } }
+int CheckDirectMatch(const uint8_t* alts,
+                     uint32_t total,
+                     const std::vector<const std::vector<uint16_t>*>& matchers,
+                     bool all_singleton,
+                     uint32_t target_sig) {
+  if (total == 0 || total > 64)
+    return 0;
+  uint8_t ng = *alts++;
+  int best = 0;
+  for (uint8_t g = 0; g < ng; ++g) {
+    uint8_t L = *alts++;
+    uint16_t nv = Rd16(alts);
+    alts += 2;
+    if (L != total) {
+      alts += static_cast<size_t>(nv) * (static_cast<size_t>(L) * 2 + 4);
+      continue;
+    }
+    for (uint16_t v = 0; v < nv; ++v) {
+      const uint8_t* tok = alts;
+      bool ordered = false;
+      if (!all_singleton ||
+          Rd32(tok + static_cast<size_t>(L) * 2) == target_sig) {
+        ordered = true;
+        for (uint32_t i = 0; i < total; ++i) {
+          if (!MatcherHas(*matchers[i], Rd16(tok + i * 2))) {
+            ordered = false;
+            break;
+          }
         }
       }
+      if (ordered)
+        return 2;
+      if (best < 1) {
+        if (total == 2) {
+          uint16_t c0 = Rd16(tok), c1 = Rd16(tok + 2);
+          const auto& m0 = *matchers[0];
+          const auto& m1 = *matchers[1];
+          if ((MatcherHas(m0, c0) && MatcherHas(m1, c1)) ||
+              (MatcherHas(m0, c1) && MatcherHas(m1, c0)))
+            best = 1;
+        } else if (total == 3) {
+          uint16_t c0 = Rd16(tok), c1 = Rd16(tok + 2), c2 = Rd16(tok + 4);
+          const auto& m0 = *matchers[0];
+          const auto& m1 = *matchers[1];
+          const auto& m2 = *matchers[2];
+          if ((MatcherHas(m0, c0) &&
+               ((MatcherHas(m1, c1) && MatcherHas(m2, c2)) ||
+                (MatcherHas(m1, c2) && MatcherHas(m2, c1)))) ||
+              (MatcherHas(m0, c1) &&
+               ((MatcherHas(m1, c0) && MatcherHas(m2, c2)) ||
+                (MatcherHas(m1, c2) && MatcherHas(m2, c0)))) ||
+              (MatcherHas(m0, c2) &&
+               ((MatcherHas(m1, c0) && MatcherHas(m2, c1)) ||
+                (MatcherHas(m1, c1) && MatcherHas(m2, c0)))))
+            best = 1;
+        } else {
+          uint16_t comps[64];
+          for (uint32_t i = 0; i < total; ++i)
+            comps[i] = Rd16(tok + i * 2);
+          bool used[64] = {false};
+          if (BipartiteMatch(comps, total, matchers, used, 0))
+            best = 1;
+        }
+      }
+      alts += static_cast<size_t>(L) * 2 + 4;
     }
   }
   return best;
 }
 
-// term -> cp 排名表（对应 get_direct_comp_rank）
-const hash_map<uint32_t, int>* GetDirectCompRank(IdsStore& store,
-                                                 const std::string& term) {
-  hash_map<uint32_t, int>* cached = g_rank_cache.Find(term);
-  if (cached)
-    return cached;
-
-  hash_map<uint32_t, int> rank;
-  int r = 1;
-  auto it = store.py_map().find(term);
-  if (it != store.py_map().end()) {
-    for (const auto& c : it->second) {
-      uint32_t cp = CpOf(c);
-      if (cp > 0 && !rank.count(cp)) {
-        rank[cp] = r;
-        ++r;
-      }
-    }
-  } else {
-    uint32_t cp = CpOf(term);
-    if (cp > 0 && !rank.count(cp)) {
-      rank[cp] = r;
-      ++r;
-    }
-  }
-  auto& slot = g_rank_cache.Ensure(term);
-  slot = std::move(rank);
-  return &slot;
-}
-
-// 打分（score_candidate）
 int64_t ScoreCandidate(
     IdsStore& store,
-    uint32_t cp,
-    const std::vector<const hash_set<std::string>*>& matchers,
+    uint32_t id,
+    const std::vector<const std::vector<uint16_t>*>& matchers,
     size_t order_count) {
-  const MetaRecord* meta = store.GetMeta(cp);
-  int freq = static_cast<int>(meta->freq);
-  int depth = static_cast<int>(meta->depth);
-
+  const HotRec& h = store.Hot(id);
+  int freq = static_cast<int>(h.freq);
+  int depth = static_cast<int>(h.depth);
   if (order_count == 1 && !matchers.empty()) {
-    std::string ch = CpToUtf8(cp);
-    if (matchers[0]->count(ch) || matchers[0]->count(Canon(ch)))
+    uint16_t ct = h.char_token;
+    if (ct != kNoToken && MatcherHas(*matchers[0], ct))
       return 30000000 + freq;
   }
-
-  int match_type = CheckDirectMatch(meta->alts, matchers);
+  size_t total = matchers.size();
+  int mt = 0;
+  if (total >= 1 && total <= 31 && (h.flags & (1u << total))) {
+    bool all_singleton = true;
+    for (auto* m : matchers) {
+      if (m->size() != 1) {
+        all_singleton = false;
+        break;
+      }
+    }
+    uint32_t target_sig = 2166136261u;
+    if (all_singleton) {
+      for (auto* m : matchers) {
+        uint16_t v = m->front();
+        target_sig ^= (v & 0xFF);
+        target_sig *= 16777619u;
+        target_sig ^= ((v >> 8) & 0xFF);
+        target_sig *= 16777619u;
+      }
+    }
+    mt = CheckDirectMatch(store.Alts(id), static_cast<uint32_t>(total),
+                          matchers, all_singleton, target_sig);
+  }
   int64_t common_bonus = (freq >= 1900000) ? 5000000 : 0;
-  if (match_type == 2)
+  if (mt == 2)
     return 20000000 + common_bonus + freq;
-  if (match_type == 1)
+  if (mt == 1)
     return 15000000 + common_bonus + freq;
   return static_cast<int64_t>(freq) - static_cast<int64_t>(depth) * 1000;
 }
@@ -890,7 +964,7 @@ int64_t ScoreCandidate(
 // ---------------------------------------------------------------------------
 
 bool HasKey(IdsStore& store, const std::string& key) {
-  return store.keys().count(key) > 0;
+  return store.FindKey(key) != nullptr;
 }
 
 void AddPostingCps(IdsStore& store,
@@ -898,59 +972,71 @@ void AddPostingCps(IdsStore& store,
                    uint32_t limit,
                    uint32_t quota,
                    std::vector<uint32_t>* cp_list,
-                   hash_set<uint32_t>* seen,
+                   EpochSet* seen,
                    const hash_set<int>* disabled_blocks) {
-  auto it = store.keys().find(key);
-  if (it == store.keys().end() || it->second.count == 0)
+  const KeyEntry* e = store.FindKey(key);
+  if (!e || e->full_cnt == 0)
     return;
-  uint32_t read_count = std::min<uint32_t>(it->second.count, quota);
-  std::vector<uint32_t> chunk;
-  chunk.reserve(read_count);
-  store.GetPostings(key, read_count, &chunk);
-
-  size_t added = 0;
-  for (uint32_t i = 0; i < chunk.size(); ++i) {
-    uint32_t cp = chunk[i];
-    if (seen->count(cp))
+  uint32_t read = std::min<uint32_t>(e->head_cnt, quota);
+  const uint32_t* head = store.HeadIds(*e);
+  uint32_t added = 0;
+  for (uint32_t i = 0; i < read; ++i) {
+    uint32_t id = head[i];
+    if (seen->Has(id))
       continue;
-    seen->insert(cp);
+    seen->Add(id);
     bool keep = true;
-    if (disabled_blocks) {
-      const MetaRecord* meta = store.GetMeta(cp);
-      if (meta && disabled_blocks->count(static_cast<int>(meta->block_id)))
-        keep = false;
-    }
+    if (disabled_blocks &&
+        disabled_blocks->count(static_cast<int>(store.Hot(id).block)))
+      keep = false;
     if (keep) {
-      cp_list->push_back(cp);
+      cp_list->push_back(id);
       ++added;
-      if (static_cast<uint32_t>(cp_list->size()) >= limit || added >= quota)
-        break;
+      if (cp_list->size() >= limit || added >= quota)
+        return;
     }
   }
+  if (cp_list->size() >= limit || read < e->head_cnt)
+    return;
+  store.ForEachFull(*e, [&](uint32_t id) -> bool {
+    if (seen->Has(id))
+      return true;
+    seen->Add(id);
+    bool keep = true;
+    if (disabled_blocks &&
+        disabled_blocks->count(static_cast<int>(store.Hot(id).block)))
+      keep = false;
+    if (keep) {
+      cp_list->push_back(id);
+      ++added;
+      if (cp_list->size() >= limit)
+        return false;
+    }
+    return true;
+  });
 }
 
 bool AddSingleCp(IdsStore& store,
                  std::vector<uint32_t>* cp_list,
-                 hash_set<uint32_t>* seen,
+                 EpochSet* seen,
                  uint32_t limit,
                  const std::string& ch,
                  const hash_set<int>* disabled_blocks) {
   uint32_t cp = CpOf(ch);
-  if (cp > 0 && !seen->count(cp)) {
-    seen->insert(cp);
-    bool keep = true;
-    if (disabled_blocks) {
-      const MetaRecord* meta = store.GetMeta(cp);
-      if (meta && disabled_blocks->count(static_cast<int>(meta->block_id)))
-        keep = false;
-    }
-    if (keep) {
-      cp_list->push_back(cp);
-      if (static_cast<uint32_t>(cp_list->size()) >= limit)
-        return true;
-    }
-  }
-  return false;
+  uint32_t id = cp ? store.IdOfCp(cp) : kInvalidId;
+  if (id == kInvalidId || seen->Has(id))
+    return false;
+  seen->Add(id);
+  if (disabled_blocks &&
+      disabled_blocks->count(static_cast<int>(store.Hot(id).block)))
+    return false;
+  cp_list->push_back(id);
+  return cp_list->size() >= limit;
+}
+
+EpochSet& SeenSet() {
+  static EpochSet s;
+  return s;
 }
 
 std::vector<uint32_t> GetCandidatesForTerm(
@@ -959,15 +1045,16 @@ std::vector<uint32_t> GetCandidatesForTerm(
     int count,
     uint32_t max_chars,
     const std::vector<std::string>* custom_keys,
-    const hash_set<int>* disabled_blocks) {
+    const hash_set<int>* disabled_blocks,
+    bool is_multi_term) {
   std::vector<uint32_t> cp_list;
-  hash_set<uint32_t> seen;
+  EpochSet& seen = SeenSet();
+  seen.Reset(store.num_chars());
   uint32_t limit = max_chars == 0 ? 200000 : max_chars;
 
   std::string cn_term = Canon(term);
 
-  // 优先注入部件/笔画本身
-  if (count == 1) {
+  if (count == 1 && !is_multi_term) {
     if ((HasKey(store, cn_term) || HasKey(store, term)) &&
         !(term.size() >= 1 && term[0] == '{')) {
       if (AddSingleCp(store, &cp_list, &seen, limit, cn_term, disabled_blocks))
@@ -979,7 +1066,8 @@ std::vector<uint32_t> GetCandidatesForTerm(
     }
     auto pit = store.py_map().find(term);
     if (pit != store.py_map().end()) {
-      for (const auto& comp : pit->second) {
+      for (uint16_t t : pit->second) {
+        const std::string& comp = store.TokenStr(t);
         if (!(comp.size() >= 1 && comp[0] == '{')) {
           if (AddSingleCp(store, &cp_list, &seen, limit, comp, disabled_blocks))
             return cp_list;
@@ -1004,71 +1092,80 @@ std::vector<uint32_t> GetCandidatesForTerm(
           break;
       }
     }
-  } else if (HasKey(store, cn_term) ||
-             (count > 1 &&
-              HasKey(store, cn_term + "*" + std::to_string(count))) ||
-             HasKey(store, term) ||
-             (count > 1 && HasKey(store, term + "*" + std::to_string(count)))) {
-    std::string key;
-    if (count > 1) {
-      if (HasKey(store, cn_term + "*" + std::to_string(count)))
-        key = cn_term + "*" + std::to_string(count);
-      else
-        key = term + "*" + std::to_string(count);
-    } else {
-      if (HasKey(store, cn_term))
-        key = cn_term;
-      else
-        key = term;
-    }
-    AddPostingCps(store, key, limit, limit, &cp_list, &seen, disabled_blocks);
   } else {
-    auto pit = store.py_map().find(term);
-    if (pit != store.py_map().end()) {
-      const auto& comps = pit->second;
-      uint32_t quota = (comps.size() <= 2)
-                           ? limit
-                           : std::max<uint32_t>(60, limit / comps.size());
-      for (const auto& comp : comps) {
-        std::string key =
-            (count > 1) ? comp + "*" + std::to_string(count) : comp;
-        AddPostingCps(store, key, limit, quota, &cp_list, &seen,
-                      disabled_blocks);
-        if (static_cast<uint32_t>(cp_list.size()) >= limit)
-          break;
+    bool has_cn = HasKey(store, cn_term);
+    bool has_term = HasKey(store, term);
+    bool has_cn_n =
+        count > 1 && HasKey(store, cn_term + "*" + std::to_string(count));
+    bool has_term_n =
+        count > 1 && HasKey(store, term + "*" + std::to_string(count));
+    if (has_cn || has_term || has_cn_n || has_term_n) {
+      std::string key;
+      if (count > 1) {
+        if (has_cn_n)
+          key = cn_term + "*" + std::to_string(count);
+        else if (has_term_n)
+          key = term + "*" + std::to_string(count);
       }
-      if (cp_list.size() < limit) {
-        for (const auto& comp : comps) {
-          std::string key =
-              (count > 1) ? comp + "*" + std::to_string(count) : comp;
-          AddPostingCps(store, key, limit, limit, &cp_list, &seen,
-                        disabled_blocks);
-          if (static_cast<uint32_t>(cp_list.size()) >= limit)
-            break;
-        }
+      if (key.empty()) {
+        if (has_cn)
+          key = cn_term;
+        else
+          key = term;
       }
+      AddPostingCps(store, key, limit, limit, &cp_list, &seen, disabled_blocks);
     } else {
-      const std::vector<std::string>* pref = GetCompsByPrefix(store, term);
-      if (pref && !pref->empty()) {
-        uint32_t quota =
-            std::max<uint32_t>(60, limit / std::max<size_t>(1, pref->size()));
-        for (const auto& comp : *pref) {
-          std::string key =
-              (count > 1) ? comp + "*" + std::to_string(count) : comp;
-          AddPostingCps(store, key, limit, quota, &cp_list, &seen,
-                        disabled_blocks);
-          if (static_cast<uint32_t>(cp_list.size()) >= limit)
-            break;
+      auto pit = store.py_map().find(term);
+      if (pit != store.py_map().end()) {
+        const auto& comps = pit->second;
+        uint32_t quota = (comps.size() <= 2)
+                             ? limit
+                             : std::max<uint32_t>(60, limit / comps.size());
+        auto emit = [&](uint32_t q) {
+          for (uint16_t t : comps) {
+            std::string key =
+                (count > 1) ? store.TokenStr(t) + "*" + std::to_string(count)
+                            : store.TokenStr(t);
+            if (HasKey(store, key))
+              AddPostingCps(store, key, limit, q, &cp_list, &seen,
+                            disabled_blocks);
+            else if (count > 1 && HasKey(store, store.TokenStr(t)))
+              AddPostingCps(store, store.TokenStr(t), limit, q, &cp_list, &seen,
+                            disabled_blocks);
+            if (static_cast<uint32_t>(cp_list.size()) >= limit)
+              return;
+          }
+        };
+        emit(quota);
+        if (cp_list.size() < limit)
+          emit(limit);
+      } else {
+        const std::vector<uint16_t>* pref = GetCompsByPrefix(store, term);
+        if (pref && !pref->empty()) {
+          uint32_t quota =
+              std::max<uint32_t>(60, limit / std::max<size_t>(1, pref->size()));
+          for (uint16_t t : *pref) {
+            std::string key =
+                (count > 1) ? store.TokenStr(t) + "*" + std::to_string(count)
+                            : store.TokenStr(t);
+            if (HasKey(store, key))
+              AddPostingCps(store, key, limit, quota, &cp_list, &seen,
+                            disabled_blocks);
+            else if (count > 1 && HasKey(store, store.TokenStr(t)))
+              AddPostingCps(store, store.TokenStr(t), limit, quota, &cp_list,
+                            &seen, disabled_blocks);
+            if (static_cast<uint32_t>(cp_list.size()) >= limit)
+              break;
+          }
         }
       }
     }
   }
-
   return cp_list;
 }
 
 // ---------------------------------------------------------------------------
-// 多项查询 term 信息（缓存）
+// 多项查询 term 信息
 // ---------------------------------------------------------------------------
 
 struct TermInfo {
@@ -1076,15 +1173,12 @@ struct TermInfo {
   int mult = 1;
   bool is_pref = false;
   std::vector<std::string> comps;
+  std::vector<uint16_t> tokens;
   std::vector<std::string> post_keys;
   size_t data_size = 0;
-  hash_set<uint32_t> comp_cps;
-  hash_set<std::string> comp_set;
-  std::shared_ptr<hash_set<uint32_t>> post_set;
-  bool set_built = false;
 };
 
-LruCache<std::string, std::shared_ptr<TermInfo>> g_term_cache(20);
+LruCache<std::string, std::shared_ptr<TermInfo>> g_term_cache(200);
 
 std::shared_ptr<TermInfo> BuildTermInfo(IdsStore& store,
                                         const std::string& term,
@@ -1092,31 +1186,37 @@ std::shared_ptr<TermInfo> BuildTermInfo(IdsStore& store,
   auto info = std::make_shared<TermInfo>();
   info->term = term;
   info->mult = mult;
-
   std::string cn_term = Canon(term);
-  std::vector<std::string> comps;
   bool is_pref = false;
-
+  std::vector<std::string> comps;
   auto pit = store.py_map().find(term);
   if (pit != store.py_map().end()) {
-    comps = pit->second;
+    for (uint16_t t : pit->second)
+      comps.push_back(store.TokenStr(t));
   } else if (HasKey(store, cn_term) || HasKey(store, term)) {
+    comps.push_back(cn_term);
     if (cn_term != term)
-      comps = {cn_term, term};
-    else
-      comps = {term};
-  } else if (const std::vector<std::string>* pref =
+      comps.push_back(term);
+  } else if (const std::vector<uint16_t>* pref =
                  GetCompsByPrefix(store, term)) {
-    comps = *pref;
+    for (uint16_t t : *pref)
+      comps.push_back(store.TokenStr(t));
     is_pref = true;
   } else {
+    comps.push_back(cn_term);
     if (cn_term != term)
-      comps = {cn_term, term};
-    else
-      comps = {term};
+      comps.push_back(term);
   }
   info->is_pref = is_pref;
   info->comps = comps;
+  for (const auto& c : comps) {
+    uint16_t t = store.ResolveTerm(c);
+    if (t != kNoToken)
+      info->tokens.push_back(t);
+  }
+  std::sort(info->tokens.begin(), info->tokens.end());
+  info->tokens.erase(std::unique(info->tokens.begin(), info->tokens.end()),
+                     info->tokens.end());
 
   int max_keys = is_pref ? 25 : 250;
   hash_set<std::string> seen_post;
@@ -1136,62 +1236,41 @@ std::shared_ptr<TermInfo> BuildTermInfo(IdsStore& store,
         break;
     }
   }
-
   size_t sz = 0;
   for (const auto& k : info->post_keys) {
-    auto it = store.keys().find(k);
-    if (it != store.keys().end())
-      sz += static_cast<size_t>(it->second.count) * 4;
+    if (const KeyEntry* e = store.FindKey(k))
+      sz += static_cast<size_t>(e->full_cnt) * 4;
   }
   info->data_size = sz;
-
-  for (const auto& c : comps) {
-    info->comp_set.insert(c);
-    info->comp_set.insert(Canon(c));
-    uint32_t c_cp = CpOf(c);
-    if (c_cp > 0)
-      info->comp_cps.insert(c_cp);
-  }
   return info;
 }
 
-// 构建 term 的倒排并集（含自身部件 cp），惰性
-bool EnsureTermPostSet(IdsStore& store, TermInfo* info) {
-  if (info->set_built)
-    return true;
-  info->set_built = true;
-  if (info->post_keys.empty()) {
-    info->post_set = std::make_shared<hash_set<uint32_t>>();
-    return false;
-  }
-  if (info->post_keys.size() == 1) {
-    info->post_set = store.GetPostingsSet(info->post_keys[0]);
-  } else {
-    auto u = std::make_shared<hash_set<uint32_t>>();
-    for (const auto& k : info->post_keys) {
-      const auto& s = store.GetPostingsSet(k);
-      u->insert(s->begin(), s->end());
-    }
-    info->post_set = u;
-  }
-  return true;
-}
-
 // ---------------------------------------------------------------------------
-// 主检索（search_components）
+// 主检索
 // ---------------------------------------------------------------------------
 
-LruCache<std::string, std::vector<uint32_t>> g_query_cache(60);
+LruCache<std::string, std::vector<uint32_t>> g_query_cache(256);
 
 std::vector<uint32_t> SearchComponents(IdsStore& store,
                                        const std::string& query_str,
                                        int max_results,
-                                       const std::string& scheme,
                                        const std::string& mode,
                                        const hash_set<int>* disabled_blocks) {
   if (query_str.empty())
     return {};
-  std::string cache_key = query_str + ":" + scheme;
+  std::string cache_key =
+      query_str + ":" + std::to_string(max_results) + ":" + mode;
+  if (disabled_blocks && !disabled_blocks->empty()) {
+    std::vector<int> ks(disabled_blocks->begin(), disabled_blocks->end());
+    std::sort(ks.begin(), ks.end());
+    std::string blk;
+    for (int b : ks) {
+      if (!blk.empty())
+        blk += ",";
+      blk += std::to_string(b);
+    }
+    cache_key += ":blk=" + blk;
+  }
   if (const std::vector<uint32_t>* hit = g_query_cache.Find(cache_key))
     return *hit;
 
@@ -1199,41 +1278,41 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
   if (pq.order.empty())
     return {};
 
-  // 每个 item（含重复）的 matcher
-  std::vector<const hash_set<std::string>*> matchers;
+  std::vector<const std::vector<uint16_t>*> matchers;
   matchers.reserve(pq.items.size());
   for (const auto& item : pq.items)
     matchers.push_back(GetTermMatcher(store, item));
 
   size_t order_count = pq.order.size();
 
-  // ----- 场景 A：单项查询 -----
+  // ----- 场景 A：单项 -----
   if (order_count == 1) {
     const std::string& term = pq.order[0];
-    const hash_map<uint32_t, int>* direct_rank = GetDirectCompRank(store, term);
-
+    const std::map<uint32_t, int>* direct_rank = GetDirectCompRank(store, term);
     bool is_pref = (store.valid_pinyins().count(term) == 0) &&
                    (GetCompsByPrefix(store, term) != nullptr);
     uint32_t limit =
         is_pref ? std::max(250u, static_cast<uint32_t>(max_results) * 3)
                 : std::max(480u, static_cast<uint32_t>(max_results) * 8);
-    std::vector<uint32_t> cands = GetCandidatesForTerm(
-        store, term, pq.counts.at(term), limit, nullptr, disabled_blocks);
+    std::vector<uint32_t> cands =
+        GetCandidatesForTerm(store, term, pq.counts.at(term), limit, nullptr,
+                             disabled_blocks, /*is_multi_term=*/false);
     if (cands.empty())
       return {};
 
     std::vector<std::pair<uint32_t, int64_t>> scored;
     scored.reserve(cands.size());
-    for (uint32_t cp : cands) {
-      int64_t sc = ScoreCandidate(store, cp, matchers, order_count);
+    for (uint32_t id : cands) {
+      int64_t sc = ScoreCandidate(store, id, matchers, order_count);
       if (direct_rank) {
+        uint32_t cp = store.CpOfId(id);
         auto rit = direct_rank->find(cp);
         if (rit != direct_rank->end()) {
-          int64_t f = static_cast<int64_t>(store.GetMeta(cp)->freq);
+          int64_t f = static_cast<int64_t>(store.Hot(id).freq);
           sc = 40000000 + f - rit->second * 10;
         }
       }
-      scored.push_back({cp, sc});
+      scored.push_back({id, sc});
     }
     std::sort(scored.begin(), scored.end(),
               [](const std::pair<uint32_t, int64_t>& a,
@@ -1245,13 +1324,12 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
         std::min<size_t>(scored.size(), static_cast<size_t>(max_results));
     for (size_t i = 0; i < lim; ++i)
       results.push_back(scored[i].first);
-
     auto& slot = g_query_cache.Ensure(cache_key);
     slot = results;
     return results;
   }
 
-  // ----- 场景 B：多项查询 -----
+  // ----- 场景 B：多项 -----
   std::vector<std::shared_ptr<TermInfo>> terms_info;
   for (const auto& term : pq.order) {
     int mult = pq.counts.at(term);
@@ -1282,7 +1360,8 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
   uint32_t base_limit = has_any_pref ? 1500 : 8000;
   std::vector<uint32_t> current =
       GetCandidatesForTerm(store, base->term, base->mult, base_limit,
-                           &base->post_keys, disabled_blocks);
+                           &base->post_keys, disabled_blocks,
+                           /*is_multi_term=*/true);
   if (current.empty())
     return {};
 
@@ -1290,17 +1369,40 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
     if (current.empty())
       break;
     TermInfo* t = terms_info[idx].get();
-    EnsureTermPostSet(store, t);
-    const auto& post_set = *t->post_set;
     std::vector<uint32_t> filtered;
     filtered.reserve(current.size());
-    for (uint32_t cp : current) {
-      if (t->comp_cps.count(cp) || post_set.count(cp))
-        filtered.push_back(cp);
+    for (uint32_t id : current) {
+      const uint16_t* cs;
+      uint16_t cn;
+      store.CompSet(id, &cs, &cn);
+      bool matched = false;
+      size_t a = 0, b = 0;
+      const auto& toks = t->tokens;
+      while (a < cn && b < toks.size()) {
+        if (cs[a] == toks[b]) {
+          matched = true;
+          break;
+        } else if (cs[a] < toks[b]) {
+          ++a;
+        } else {
+          ++b;
+        }
+      }
+      if (!matched) {
+        for (const auto& k : t->post_keys) {
+          if (const KeyEntry* e = store.FindKey(k)) {
+            if (store.FullContains(*e, id)) {
+              matched = true;
+              break;
+            }
+          }
+        }
+      }
+      if (matched)
+        filtered.push_back(id);
     }
     current.swap(filtered);
   }
-
   if (current.empty())
     return {};
 
@@ -1309,10 +1411,9 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
   size_t n_score =
       std::min<size_t>(current.size(), static_cast<size_t>(score_limit));
   scored.reserve(n_score);
-  for (size_t i = 0; i < n_score; ++i) {
+  for (size_t i = 0; i < n_score; ++i)
     scored.push_back(
         {current[i], ScoreCandidate(store, current[i], matchers, order_count)});
-  }
   std::sort(scored.begin(), scored.end(),
             [](const std::pair<uint32_t, int64_t>& a,
                const std::pair<uint32_t, int64_t>& b) {
@@ -1323,34 +1424,9 @@ std::vector<uint32_t> SearchComponents(IdsStore& store,
       std::min<size_t>(scored.size(), static_cast<size_t>(max_results));
   for (size_t i = 0; i < lim; ++i)
     results.push_back(scored[i].first);
-
   auto& slot = g_query_cache.Ensure(cache_key);
   slot = results;
   return results;
-}
-
-// ---------------------------------------------------------------------------
-// 块别名
-// ---------------------------------------------------------------------------
-
-const hash_map<std::string, int>& BlockAliasMap() {
-  static const hash_map<std::string, int> m = {
-      {"基本", 0},      {"基本区", 0},      {"basic", 0},     {"base", 0},
-      {"cjk", 0},       {"扩a", 1},         {"exta", 1},      {"ext-a", 1},
-      {"a", 1},         {"扩b", 2},         {"extb", 2},      {"ext-b", 2},
-      {"b", 2},         {"扩c", 3},         {"extc", 3},      {"ext-c", 3},
-      {"c", 3},         {"扩d", 4},         {"extd", 4},      {"ext-d", 4},
-      {"d", 4},         {"扩e", 5},         {"exte", 5},      {"ext-e", 5},
-      {"e", 5},         {"扩f", 6},         {"extf", 6},      {"ext-f", 6},
-      {"f", 6},         {"扩g", 7},         {"extg", 7},      {"ext-g", 7},
-      {"g", 7},         {"扩h", 8},         {"exth", 8},      {"ext-h", 8},
-      {"h", 8},         {"扩i", 9},         {"exti", 9},      {"ext-i", 9},
-      {"i", 9},         {"扩j", 10},        {"extj", 10},     {"ext-j", 10},
-      {"j", 10},        {"兼容区", 11},     {"兼容", 11},     {"compat", 11},
-      {"兼容补充", 12}, {"compat-sup", 12}, {"部首补充", 13}, {"rad-sup", 13},
-      {"康熙部首", 14}, {"kangxi", 14},     {"笔画", 15},     {"strokes", 15},
-  };
-  return m;
 }
 
 const char* kBlockNames[17] = {
@@ -1370,12 +1446,10 @@ std::string ToLower(const std::string& s) {
 
 IdsSearchTranslator::IdsSearchTranslator(const rime::Ticket& ticket)
     : rime::Translator(ticket) {
-  // schema 中以 `- ids_search_translator`（无 @别名）引用时，Ticket 的
-  // name_space 会是 "translator"，需自纠正到我们的配置命名空间，
-  // 否则 ids_search_translator/ 下的配置全部读不到。
-  // （与官方 reverse_lookup_translator 的处理方式一致。）
+  // 组件以 `- ids_search_translator` 引用时 name_space 默认是 "translator"，
+  // 自纠正到配置命名空间 ids_search。
   if (ticket.name_space == "translator" || name_space_.empty()) {
-    name_space_ = "ids_search_translator";
+    name_space_ = "ids_search";
   }
   Initialize();
 }
@@ -1388,13 +1462,10 @@ void IdsSearchTranslator::Initialize() {
   if (!config)
     return;
   std::string ns = name_space_ + "/";
-  config->GetString(ns + "index_file", &index_path_);
-  config->GetString(ns + "meta_file", &meta_path_);
+  config->GetString(ns + "data_file", &data_path_);
   config->GetString(ns + "custom_file", &custom_path_);
-  if (index_path_.empty())
-    index_path_ = "ids_index.bin";
-  if (meta_path_.empty())
-    meta_path_ = "ids_meta.bin";
+  if (data_path_.empty())
+    data_path_ = "ids_data.bin";
 
   config->GetString(ns + "tag", &tag_);
   if (tag_.empty())
@@ -1420,7 +1491,6 @@ void IdsSearchTranslator::Initialize() {
   if (config->GetBool(ns + "show_block", &v))
     show_block_ = v;
 
-  // 检测 switches 中的开关（供运行时 get_option 覆盖）
   for (size_t i = 0; i < 64; ++i) {
     std::string s_name;
     if (config->GetString("switches/@" + std::to_string(i) + "/name",
@@ -1439,7 +1509,6 @@ void IdsSearchTranslator::Initialize() {
     }
   }
 
-  // disabled_blocks
   if (rime::an<rime::ConfigList> list =
           config->GetList(ns + "disabled_blocks")) {
     for (size_t i = 0; i < list->size(); ++i) {
@@ -1452,8 +1521,30 @@ void IdsSearchTranslator::Initialize() {
         }
       }
     }
-    disabled_blocks_enabled_ = !disabled_blocks_.empty();
   }
+  {
+    std::string str;
+    if (config->GetString(ns + "disabled_blocks", &str) && !str.empty()) {
+      size_t i = 0;
+      while (i < str.size()) {
+        while (i < str.size() &&
+               (str[i] == ',' || str[i] == ' ' || str[i] == '\t' ||
+                str[i] == '\r' || str[i] == '\n'))
+          ++i;
+        size_t j = i;
+        while (j < str.size() && str[j] != ',' && str[j] != ' ' &&
+               str[j] != '\t' && str[j] != '\r' && str[j] != '\n')
+          ++j;
+        if (j > i) {
+          auto it = BlockAliasMap().find(ToLower(str.substr(i, j - i)));
+          if (it != BlockAliasMap().end())
+            disabled_blocks_.insert(it->second);
+        }
+        i = j;
+      }
+    }
+  }
+  disabled_blocks_enabled_ = !disabled_blocks_.empty();
 
   prefix_len_ = prefix_.size();
   prefix_byte_ = prefix_len_ ? prefix_[0] : 0;
@@ -1477,45 +1568,39 @@ std::string IdsSearchTranslator::PinyinMode() {
 
 bool IdsSearchTranslator::EnsureLoaded() {
   IdsStore& store = IdsStore::Instance();
-  if (store.loaded())
-    return true;
-  if (!initialized_)
-    Initialize();
-
-  fs::path idx;
-  fs::path meta;
-  fs::path custom;
-  std::string ip = index_path_.empty() ? "ids_index.bin" : index_path_;
-  std::string mp = meta_path_.empty() ? "ids_meta.bin" : meta_path_;
-  rime::Deployer& deployer = rime::Service::instance().deployer();
-
-  auto resolve = [&](const std::string& filename) -> fs::path {
-    fs::path p(filename);
-    if (p.is_absolute())
-      return p;
-    fs::path ud = deployer.user_data_dir / filename;
-    if (fs::exists(ud))
+  if (!store.loaded()) {
+    if (!initialized_)
+      Initialize();
+    std::string dp = data_path_.empty() ? "ids_data.bin" : data_path_;
+    rime::Deployer& deployer = rime::Service::instance().deployer();
+    auto resolve = [&](const std::string& filename) -> fs::path {
+      fs::path p(filename);
+      if (p.is_absolute())
+        return p;
+      fs::path ud = deployer.user_data_dir / filename;
+      if (fs::exists(ud))
+        return ud;
+      fs::path sd = deployer.shared_data_dir / filename;
+      if (fs::exists(sd))
+        return sd;
       return ud;
-    fs::path sd = deployer.shared_data_dir / filename;
-    if (fs::exists(sd))
-      return sd;
-    return ud;
-  };
-
-  idx = resolve(ip);
-  meta = resolve(mp);
-  if (!custom_path_.empty())
-    custom = resolve(custom_path_);
-  bool ok = store.Load(idx, meta, custom);
-  if (!ok) {
-    LOG(ERROR) << "ids_search_translator: cannot load data files: index='"
-               << idx << "' meta='" << meta << "'";
-    if (!custom.empty()) {
-      LOG(ERROR) << "ids_search_translator: custom file='"
-                 << custom.string() << "'";
+    };
+    fs::path data = resolve(dp);
+    fs::path custom;
+    if (!custom_path_.empty())
+      custom = resolve(custom_path_);
+    bool ok = store.Load(data, custom);
+    if (!ok) {
+      LOG(ERROR) << "ids_search_translator: cannot load data file: '" << data
+                 << "'";
+      return false;
     }
   }
-  return ok;
+  for (int b : store.custom_disabled_blocks()) {
+    if (disabled_blocks_.insert(b).second)
+      disabled_blocks_enabled_ = true;
+  }
+  return true;
 }
 
 std::vector<uint32_t> IdsSearchTranslator::Search(const std::string& query_raw,
@@ -1523,8 +1608,7 @@ std::vector<uint32_t> IdsSearchTranslator::Search(const std::string& query_raw,
   IdsStore& store = IdsStore::Instance();
   const hash_set<int>* disabled =
       disabled_blocks_enabled_ ? &disabled_blocks_ : nullptr;
-  return SearchComponents(store, query_raw, max_results_, shuangpin_scheme_,
-                          mode, disabled);
+  return SearchComponents(store, query_raw, max_results_, mode, disabled);
 }
 
 rime::an<rime::Translation> IdsSearchTranslator::BuildCandidates(
@@ -1548,32 +1632,34 @@ rime::an<rime::Translation> IdsSearchTranslator::BuildCandidates(
     if (has_sw_block_)
       sw_b = ctx->get_option("show_block");
   }
-
   auto translation = rime::New<rime::FifoTranslation>();
-  for (uint32_t cp : results) {
-    const MetaRecord* meta = store.GetMeta(cp);
+  for (uint32_t id : results) {
+    const uint8_t* py;
+    const uint8_t* ids;
+    uint16_t py_len, ids_len;
+    store.Cold(id, &py, &py_len, &ids, &ids_len);
+    const HotRec& hot = store.Hot(id);
     std::vector<std::string> parts;
-    if (sw_p && !meta->py.empty())
-      parts.push_back(meta->py);
-    if (sw_i && !meta->ids.empty())
-      parts.push_back(meta->ids);
+    if (sw_p && py_len > 0)
+      parts.push_back(std::string(reinterpret_cast<const char*>(py), py_len));
+    if (sw_i && ids_len > 0)
+      parts.push_back(std::string(reinterpret_cast<const char*>(ids), ids_len));
+    uint32_t cp = store.CpOfId(id);
     if (sw_u) {
       char buf[8];
       std::snprintf(buf, sizeof(buf), "%04X", cp);
       parts.push_back(buf);
     }
     if (sw_b) {
-      const char* bname =
-          meta->block_id < 17 ? kBlockNames[meta->block_id] : "基本";
+      const char* bname = hot.block < 17 ? kBlockNames[hot.block] : "基本";
       parts.push_back(bname);
     }
     std::string comment = Join(parts, " ");
     std::string ch = CpToUtf8(cp);
-    std::string preedit = prefix_len_ > 0 ? query_raw : "";
-    auto cand = rime::New<rime::SimpleCandidate>("ids_search", start_pos,
-                                                 end_pos, ch, comment, preedit);
-    if (prefix_len_ > 0)
-      cand->set_preedit(query_raw);
+    auto cand = rime::New<rime::SimpleCandidate>(
+        "ids_search", start_pos, end_pos, ch, comment,
+        prefix_len_ > 0 ? query_raw : "");
+    cand->set_quality(100.0);
     translation->Append(cand);
   }
   return translation;
@@ -1582,7 +1668,6 @@ rime::an<rime::Translation> IdsSearchTranslator::BuildCandidates(
 rime::an<rime::Translation> IdsSearchTranslator::Query(
     const std::string& input,
     const rime::Segment& segment) {
-  // tag 门禁
   if (!segment.HasTag(tag_))
     return nullptr;
   if (!initialized_)
@@ -1602,12 +1687,10 @@ rime::an<rime::Translation> IdsSearchTranslator::Query(
   }
 
   if (query_raw.empty()) {
-    // 提示候选
     auto cand = rime::New<rime::SimpleCandidate>(
         "ids_search", start_pos, end_pos, "", tips_, input + " " + tips_);
     auto translation = rime::New<rime::FifoTranslation>();
     translation->Append(cand);
-    EnsureLoaded();  // 与 Lua 一致：空查询即预热加载
     return translation;
   }
 
